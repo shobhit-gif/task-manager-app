@@ -263,13 +263,16 @@ ALLOWED_ASSIGN = {
 # ============================================================
 # Google Sheets Setup
 # ============================================================
-SERVICE_JSON = st.secrets["gcp_service_account"]["json_path"]
+SERVICE_ACCOUNT_INFO = st.secrets["gcp_service_account"]["service_account_json"]
 SHEET_ID = st.secrets["google_sheets"]["sheet_id"]
 
 
 def connect_to_gspread():
-    creds = Credentials.from_service_account_file(
-        SERVICE_JSON,
+    import json
+    service_account_info = json.loads(SERVICE_ACCOUNT_INFO)
+
+    creds = Credentials.from_service_account_info(
+        service_account_info,
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
