@@ -321,132 +321,152 @@ COL_IDX = {c: i + 1 for i, c in enumerate(COLS)}  # 1-based for gspread
 def load_tasks_from_sheet(force_reload=False):
     """
     Load tasks into session cache. If available and not forced, return cached.
+    SAFE against broken / partially empty Google Sheet rows.
     """
     if not force_reload and "tasks_cache" in st.session_state:
         return st.session_state["tasks_cache"]
 
-    data = sheet.get_all_records()
+    # ✅ SAFETY FIX: default_blank prevents crashes
+    data = sheet.get_all_records(default_blank="")
+
     cols = COLS.copy()
+
     if not data:
         df = pd.DataFrame(columns=cols)
     else:
         df = pd.DataFrame(data)
+
+        # Ensure all expected columns exist
         for c in cols:
             if c not in df.columns:
                 df[c] = ""
+
+        # Enforce strict column order
         df = df[cols].fillna("")
 
-    # store cache and an index map for fast lookup
+    # Store cache and rebuild index
     st.session_state["tasks_cache"] = df.reset_index(drop=True)
     build_index_map()
+
     return st.session_state["tasks_cache"]
 
 
 def build_index_map():
     """
     Build a dictionary to lookup row index (0-based) by signature.
-    Signature uses (created_at, assigned_by, task) — falls back to lesser keys when needed.
+    Signature uses (created_at, assigned_by, task) with safe fallbacks.
     """
     df = st.session_state.get("tasks_cache")
     idx = {}
-    if df is None:
+
+    if df is None or df.empty:
         st.session_state["tasks_index_map"] = idx
         return idx
 
     for i, r in df.reset_index(drop=True).iterrows():
-        key = (r.get("created_at", ""), r.get("assigned_by", ""), r.get("task", ""))
-        idx[key] = i
-        # also add fallbacks
-        key2 = (r.get("created_at", ""), r.get("assigned_by", ""), None)
-        if key2 not in idx:
-            idx[key2] = i
-        key3 = (None, r.get("assigned_by", ""), r.get("task", ""))
-        if key3 not in idx:
-            idx[key3] = i
+        created_at = r.get("created_at", "")
+        assigned_by = r.get("assigned_by", "")
+        task = r.get("task", "")
+
+        idx[(created_at, assigned_by, task)] = i
+        idx.setdefault((created_at, assigned_by, None), i)
+        idx.setdefault((None, assigned_by, task), i)
+
     st.session_state["tasks_index_map"] = idx
     return idx
 
 
 def find_task_index_by_signature(created_at_ts, assigned_by_val, task_name):
-    """Use index map (O(1)) with fallbacks."""
+    """
+    Fast lookup using pre-built index map.
+    """
     idx = st.session_state.get("tasks_index_map", {})
-    # try exact
-    k = (created_at_ts, assigned_by_val, task_name)
-    if k in idx:
-        return idx[k]
-    # created_at + assigned_by
-    k = (created_at_ts, assigned_by_val, None)
-    if k in idx:
-        return idx[k]
-    # task + assigned_by
-    k = (None, assigned_by_val, task_name)
-    if k in idx:
-        return idx[k]
-    # fallback: try created_at alone
-    for key, v in idx.items():
-        if key[0] == created_at_ts:
+
+    for key in [
+        (created_at_ts, assigned_by_val, task_name),
+        (created_at_ts, assigned_by_val, None),
+        (None, assigned_by_val, task_name),
+    ]:
+        if key in idx:
+            return idx[key]
+
+    # Final fallback
+    for k, v in idx.items():
+        if k[0] == created_at_ts:
             return v
+
     return None
+
 
 # ============================================================
 # Sheet update primitives (partial updates to minimize round-trips)
 # ============================================================
 def append_task_to_sheet(row: dict):
-    """Append a new row to sheet and update cache.
-    Row is dict with keys = COLS.
-    Returns new 0-based index.
     """
-    values = [row.get(c, "") for c in COLS]
-    sheet.append_row(values)
+    SAFELY append a new row to sheet using header-based mapping.
+    This GUARANTEES correct column order forever.
+    """
 
-    # Update cache locally without reloading whole sheet
+    # ✅ SOURCE OF TRUTH: read headers from sheet
+    headers = sheet.row_values(1)
+
+    # Build row strictly in header order
+    values = [row.get(h, "") for h in headers]
+
+    sheet.append_row(
+        values,
+        value_input_option="USER_ENTERED"
+    )
+
+    # Update local cache safely
     df = st.session_state.get("tasks_cache")
     if df is None:
         df = load_tasks_from_sheet(force_reload=True)
     else:
-        new_idx = len(df)
-        df.loc[new_idx] = values
+        df.loc[len(df)] = values
         st.session_state["tasks_cache"] = df
         build_index_map()
+
     return len(st.session_state["tasks_cache"]) - 1
 
 
 def update_single_cell_in_sheet(row_idx_zero_based: int, col_name: str, value):
-    """Update a single cell (minimizes payload). row_idx_zero_based is index in df (0-based).
     """
-    # gspread is 1-based and has header row in row 1
-    row_num = row_idx_zero_based + 2
+    Update a single cell (safe, minimal payload).
+    """
+    row_num = row_idx_zero_based + 2  # header offset
     col_num = COL_IDX[col_name]
+
     sheet.update_cell(row_num, col_num, value)
 
-    # reflect in cache
+    # Reflect in cache
     df = st.session_state.get("tasks_cache")
     if df is not None and row_idx_zero_based < len(df):
         df.at[row_idx_zero_based, col_name] = value
         st.session_state["tasks_cache"] = df
-        # index map may depend on changed fields; rebuild safely
         build_index_map()
 
 
 def delete_row_in_sheet(row_idx_zero_based: int):
-    """Delete a row from sheet and update cache. Use gspread.delete_rows(row_number).
+    """
+    Delete a row safely and sync cache.
     """
     row_num = row_idx_zero_based + 2
+
     try:
         sheet.delete_rows(row_num)
     except Exception:
-        # fallback to full rewrite (rare)
+        # Rare fallback: rewrite entire sheet safely
         df = st.session_state.get("tasks_cache")
         if df is not None:
             df2 = df.drop(index=row_idx_zero_based).reset_index(drop=True)
-            # rewrite whole sheet safely
             sheet.clear()
             sheet.update([COLS] + df2.values.tolist())
             st.session_state["tasks_cache"] = df2
             build_index_map()
             return
 
-    # update local cache
+    # Update cache
     df = st.session_state.get("tasks_cache")
     if df is not None:
         df2 = df.drop(index=row_idx_zero_based).reset_index(drop=True)
